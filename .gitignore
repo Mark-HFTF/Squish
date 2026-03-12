@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+release/
+release-portable/
+*.asar
+*.blockmap
+*.exe
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.cache
+ffmpeg2pass*
+*-attempt-*.log
+*-attempt-*.log.mbtree
+
+# Test coverage
+coverage/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
