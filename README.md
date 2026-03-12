@@ -2,6 +2,8 @@
 
 Native desktop batch transcoder made by Hi from the Future.
 
+![Squish desktop app](public/images/squish.webp)
+
 ## What it does
 
 - Drag in local video files
