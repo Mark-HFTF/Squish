@@ -105,3 +105,21 @@ export function parseFrameRate(value) {
   const fps = numerator / denominator;
   return Number.isFinite(fps) && fps > 0 ? fps : null;
 }
+
+export function pixelFormatHasAlpha(value) {
+  if (!value || typeof value !== 'string') {
+    return false;
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  return (
+    normalized.startsWith('yuva')
+    || normalized.startsWith('gbrap')
+    || normalized.startsWith('rgba')
+    || normalized.startsWith('bgra')
+    || normalized.startsWith('argb')
+    || normalized.startsWith('abgr')
+    || normalized.startsWith('ya')
+  );
+}

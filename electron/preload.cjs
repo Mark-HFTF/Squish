@@ -7,6 +7,9 @@ contextBridge.exposeInMainWorld('squishDesktop', {
   chooseFfmpeg() {
     return ipcRenderer.invoke('squish:choose-ffmpeg');
   },
+  installFfmpeg() {
+    return ipcRenderer.invoke('squish:install-ffmpeg');
+  },
   chooseOutputDirectory() {
     return ipcRenderer.invoke('squish:choose-output-directory');
   },
@@ -48,6 +51,14 @@ contextBridge.exposeInMainWorld('squishDesktop', {
 
     return () => {
       ipcRenderer.removeListener('squish:job-event', listener);
+    };
+  },
+  onFfmpegInstallEvent(callback) {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('squish:ffmpeg-install-event', listener);
+
+    return () => {
+      ipcRenderer.removeListener('squish:ffmpeg-install-event', listener);
     };
   },
 });

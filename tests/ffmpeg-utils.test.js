@@ -5,6 +5,7 @@ import {
   parseFrameRate,
   parseProgressLine,
   parseTimecodeToSeconds,
+  pixelFormatHasAlpha,
   resolvePeerBinary,
 } from '../electron/ffmpeg-utils.js';
 
@@ -37,6 +38,19 @@ describe('parseFrameRate', () => {
 
   it('returns null for invalid frame rates', () => {
     expect(parseFrameRate('0/0')).toBeNull();
+  });
+});
+
+describe('pixelFormatHasAlpha', () => {
+  it('recognizes alpha-carrying pixel formats', () => {
+    expect(pixelFormatHasAlpha('yuva420p')).toBe(true);
+    expect(pixelFormatHasAlpha('yuva444p10le')).toBe(true);
+    expect(pixelFormatHasAlpha('gbrap12le')).toBe(true);
+  });
+
+  it('returns false for opaque pixel formats', () => {
+    expect(pixelFormatHasAlpha('yuv420p')).toBe(false);
+    expect(pixelFormatHasAlpha('yuv444p10le')).toBe(false);
   });
 });
 

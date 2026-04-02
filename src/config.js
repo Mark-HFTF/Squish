@@ -1,9 +1,10 @@
 export const PRESETS = {
-  totalVariants: 6,
+  totalVariants: 8,
   tiers: [
     { id: 'source', label: 'Source', cap: null },
     { id: '720p', label: '720p', cap: { width: 1280, height: 720 } },
     { id: '480p', label: '480p', cap: { width: 854, height: 480 } },
+    { id: '240p', label: '240p', cap: { width: 426, height: 240 } },
   ],
   formats: {
     mp4: {
@@ -26,6 +27,7 @@ export const PRESETS = {
   videoDelivery: {
     fpsSplit: 30,
     rungOrder: [
+      { id: '240', width: 426, height: 240, tileColumns: 1 },
       { id: '360', width: 640, height: 360, tileColumns: 1 },
       { id: '480', width: 854, height: 480, tileColumns: 1 },
       { id: '720', width: 1280, height: 720, tileColumns: 1 },
@@ -50,13 +52,19 @@ export const PRESETS = {
         source: 21,
         '720p': 23,
         '480p': 25,
+        '240p': 27,
       },
       audioBitrateByTier: {
         source: '128k',
         '720p': '96k',
         '480p': '64k',
+        '240p': '48k',
       },
       vbvByRung: {
+        '240': {
+          le30: { maxrate: 500_000, bufsize: 1_000_000 },
+          gt30: { maxrate: 750_000, bufsize: 1_500_000 },
+        },
         '360': {
           le30: { maxrate: 900_000, bufsize: 1_800_000 },
           gt30: { maxrate: 1_300_000, bufsize: 2_600_000 },
@@ -92,13 +100,19 @@ export const PRESETS = {
         source: 31,
         '720p': 33,
         '480p': 35,
+        '240p': 37,
       },
       audioBitrateByTier: {
         source: '96k',
         '720p': '64k',
         '480p': '48k',
+        '240p': '32k',
       },
       targetBitrateByRung: {
+        '240': {
+          le30: 260_000,
+          gt30: 400_000,
+        },
         '360': {
           le30: 450_000,
           gt30: 700_000,
@@ -170,6 +184,44 @@ export const PRESETS = {
           baseArgs: ['-lossless', '0'],
         },
       ],
+    },
+  },
+  poster: {
+    cap: { width: 1920, height: 1080 },
+    format: {
+      id: 'webp',
+      label: 'WebP',
+      extension: 'webp',
+      mimeType: 'image/webp',
+      quality: 82,
+      compressionLevel: 6,
+    },
+  },
+  alphaVideo: {
+    webmPixelFormat: 'yuva420p',
+    webmProfiles: [
+      {
+        encoder: 'libvpx',
+        label: 'libvpx (VP8 alpha)',
+        executionMode: 'single-pass-alpha-webm',
+        args: ['-deadline', 'good', '-cpu-used', '2', '-auto-alt-ref', '0'],
+      },
+      {
+        encoder: 'libvpx-vp9',
+        label: 'libvpx-vp9 (VP9 alpha)',
+        executionMode: 'single-pass-alpha-webm',
+        args: ['-deadline', 'good', '-row-mt', '1', '-frame-parallel', '1', '-speed', '2', '-auto-alt-ref', '0', '-lag-in-frames', '0'],
+      },
+    ],
+    safari: {
+      videotoolbox: {
+        encoder: 'hevc_videotoolbox',
+        encoderLabel: 'hevc_videotoolbox',
+        optionName: 'alpha_quality',
+        optionValue: '0.75',
+        pixelFormat: 'bgra',
+        baseArgs: ['-allow_sw', '1', '-tag:v', 'hvc1', '-movflags', '+faststart'],
+      },
     },
   },
 };

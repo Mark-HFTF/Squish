@@ -16,12 +16,31 @@ function selectProfile(profiles, availableEncoders) {
   return profiles.find((profile) => availableEncoders.has(profile.encoder)) ?? null;
 }
 
-export function resolveCodecSupport(availableEncoders) {
+export function resolveCodecSupport(availableEncoders, capabilityHints = {}) {
   const encoderSet = normalizeEncoderSet(availableEncoders);
   const formats = {};
   const images = {};
   const notices = [];
   const errors = [];
+  const alphaWebmProfile = selectProfile(PRESETS.alphaVideo.webmProfiles, encoderSet);
+  const alphaTargets = {
+    webm: {
+      supported: Boolean(alphaWebmProfile),
+      encoder: alphaWebmProfile?.encoder ?? '',
+      label: alphaWebmProfile?.label ?? '',
+      executionMode: alphaWebmProfile?.executionMode ?? '',
+      args: alphaWebmProfile?.args ?? [],
+    },
+    safari: capabilityHints.alphaTargets?.safari ?? {
+      supported: false,
+      encoder: '',
+      label: '',
+      optionName: '',
+      optionValue: '',
+      pixelFormat: '',
+      baseArgs: [],
+    },
+  };
 
   for (const format of Object.values(PRESETS.formats)) {
     const videoProfile = selectProfile(format.videoProfiles, encoderSet);
@@ -60,10 +79,19 @@ export function resolveCodecSupport(availableEncoders) {
     notices.push('This FFmpeg build cannot create WebP images because no supported WebP encoder was found.');
   }
 
+  if (!alphaTargets.webm.supported) {
+    notices.push('Alpha WebM output is unavailable because this FFmpeg build does not expose a supported WebM alpha encoder.');
+  }
+
+  if (!alphaTargets.safari.supported) {
+    notices.push('Safari alpha output is unavailable because this FFmpeg build does not expose a verified HEVC alpha encoder path. In practice this usually means a macOS VideoToolbox build is required.');
+  }
+
   return {
     supported: errors.length === 0,
     formats,
     images,
+    alphaTargets,
     notices,
     errors,
   };

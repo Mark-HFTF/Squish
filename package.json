@@ -1,6 +1,6 @@
 {
   "name": "squish",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Native desktop batch transcoder for MP4 and WebM outputs.",
   "author": "Hi from the Future",

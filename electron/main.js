@@ -1,6 +1,12 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  clearSavedFfmpegConfig,
+  getSavedFfmpegConfig,
+  saveFfmpegConfig,
+} from './app-config.js';
+import { installWindowsFfmpeg } from './ffmpeg-installer.js';
 import {
   describeFiles,
   detectFfmpegTools,
@@ -17,6 +23,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 let mainWindow = null;
+let ffmpegInstallInFlight = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -39,8 +46,129 @@ function createWindow() {
   });
 }
 
+function showAboutDialog() {
+  const version = app.getVersion();
+
+  return dialog.showMessageBox(mainWindow, {
+    type: 'info',
+    title: 'About Squish',
+    message: 'Squish',
+    detail: `made by Hi from the Future\nVersion ${version}`,
+    buttons: ['OK'],
+  });
+}
+
+function createAppMenu() {
+  const versionLabel = `Version ${app.getVersion()}`;
+  const isMac = process.platform === 'darwin';
+  const template = [
+    ...(isMac
+      ? [{
+        label: app.name,
+        submenu: [
+          { role: 'about', label: 'About Squish' },
+          { type: 'separator' },
+          { role: 'services' },
+          { type: 'separator' },
+          { role: 'hide' },
+          { role: 'hideOthers' },
+          { role: 'unhide' },
+          { type: 'separator' },
+          { role: 'quit' },
+        ],
+      }]
+      : []),
+    {
+      label: 'File',
+      submenu: [
+        isMac ? { role: 'close' } : { role: 'quit' },
+      ],
+    },
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        ...(isMac
+          ? [
+            { role: 'pasteAndMatchStyle' },
+            { role: 'delete' },
+            { role: 'selectAll' },
+            { type: 'separator' },
+            {
+              label: 'Speech',
+              submenu: [
+                { role: 'startSpeaking' },
+                { role: 'stopSpeaking' },
+              ],
+            },
+          ]
+          : [
+            { role: 'delete' },
+            { type: 'separator' },
+            { role: 'selectAll' },
+          ]),
+      ],
+    },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' },
+        { role: 'forceReload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' },
+      ],
+    },
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'zoom' },
+        ...(isMac
+          ? [
+            { type: 'separator' },
+            { role: 'front' },
+            { type: 'separator' },
+            { role: 'window' },
+          ]
+          : [
+            { role: 'close' },
+          ]),
+      ],
+    },
+    {
+      role: 'help',
+      submenu: [
+        {
+          label: versionLabel,
+          enabled: false,
+        },
+        {
+          label: 'About Squish',
+          click: () => {
+            void showAboutDialog();
+          },
+        },
+      ],
+    },
+  ];
+
+  const menu = Menu.buildFromTemplate(template);
+  Menu.setApplicationMenu(menu);
+}
+
 app.whenReady().then(() => {
   registerIpcHandlers();
+  createAppMenu();
   createWindow();
 
   app.on('activate', () => {
@@ -57,7 +185,19 @@ app.on('window-all-closed', () => {
 });
 
 function registerIpcHandlers() {
-  ipcMain.handle('squish:detect-ffmpeg', async () => detectFfmpegTools());
+  ipcMain.handle('squish:detect-ffmpeg', async () => {
+    const savedFfmpeg = await getSavedFfmpegConfig();
+    const detected = await detectFfmpegTools(savedFfmpeg);
+
+    if (detected.staleSavedPath) {
+      await clearSavedFfmpegConfig();
+    }
+
+    return {
+      ...detected,
+      installSupported: process.platform === 'win32',
+    };
+  });
 
   ipcMain.handle('squish:choose-ffmpeg', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -76,13 +216,61 @@ function registerIpcHandlers() {
     const ffprobePath = resolvePeerBinary(ffmpegPath, 'ffprobe');
 
     try {
-      return await validateToolPair(ffmpegPath, ffprobePath);
+      const validated = await validateToolPair(ffmpegPath, ffprobePath);
+      await saveFfmpegConfig(validated);
+      return {
+        ...validated,
+        source: 'manual',
+      };
     } catch (error) {
       if (ffprobePath !== 'ffprobe') {
-        return validateToolPair(ffmpegPath, 'ffprobe');
+        const validated = await validateToolPair(ffmpegPath, 'ffprobe');
+        await saveFfmpegConfig(validated);
+        return {
+          ...validated,
+          source: 'manual',
+        };
       }
 
       throw error;
+    }
+  });
+
+  ipcMain.handle('squish:install-ffmpeg', async () => {
+    if (process.platform !== 'win32') {
+      throw new Error('Automatic FFmpeg installation is only available on Windows.');
+    }
+
+    if (ffmpegInstallInFlight) {
+      throw new Error('FFmpeg installation is already running.');
+    }
+
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose where to install FFmpeg',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+      return null;
+    }
+
+    const installDirectory = result.filePaths[0];
+    ffmpegInstallInFlight = installWindowsFfmpeg({
+      installDirectory,
+      emitProgress: (payload) => {
+        mainWindow?.webContents.send('squish:ffmpeg-install-event', payload);
+      },
+    });
+
+    try {
+      const installed = await ffmpegInstallInFlight;
+      await saveFfmpegConfig(installed);
+      return {
+        ...installed,
+        source: 'installed',
+      };
+    } finally {
+      ffmpegInstallInFlight = null;
     }
   });
 

@@ -9,6 +9,11 @@ import {
 } from '../src/lib/video-delivery.js';
 
 describe('video delivery laddering', () => {
+  it('uses the 240 rung for small outputs', () => {
+    const rung = resolvePixelAreaRung({ width: 426, height: 240 });
+    expect(rung.id).toBe('240');
+  });
+
   it('uses pixel area so tall 720-high outputs fall into the 480 rung', () => {
     const rung = resolvePixelAreaRung({ width: 404, height: 720 });
     expect(rung.id).toBe('480');
@@ -33,6 +38,17 @@ describe('video delivery laddering', () => {
     expect(profile.baselineTargetBps).toBe(700_000);
     expect(profile.tileColumns).toBe(1);
     expect(profile.crf).toBe(35);
+  });
+
+  it('resolves 240p profiles from the new low rung', () => {
+    const mp4Profile = resolveMp4EncodingProfile('240p', { width: 426, height: 240 }, 24);
+    const webmProfile = resolveWebmEncodingProfile('240p', { width: 426, height: 240 }, 24);
+
+    expect(mp4Profile.maxrateBps).toBe(500_000);
+    expect(mp4Profile.bufsizeBps).toBe(1_000_000);
+    expect(mp4Profile.crf).toBe(27);
+    expect(webmProfile.baselineTargetBps).toBe(260_000);
+    expect(webmProfile.crf).toBe(37);
   });
 
   it('derives tighter retry budgets for VP9 size enforcement', () => {

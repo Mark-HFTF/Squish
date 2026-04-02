@@ -3,7 +3,12 @@ import '@fontsource/ibm-plex-mono/500.css';
 import '@fontsource/ibm-plex-mono/700.css';
 import './style.css';
 import { PRESETS } from './config.js';
-import { buildImageVariantPlan, buildVideoVariantPlan, getVariantLabel } from './lib/commands.js';
+import {
+  buildImageVariantPlan,
+  buildPosterVariant,
+  buildVideoJobPlan,
+  getVariantLabel,
+} from './lib/commands.js';
 import {
   createUniqueBaseName,
   escapeHtml,
@@ -55,6 +60,7 @@ app.innerHTML = `
     <section class="toolbar">
       <div class="toolbar-actions">
         <button class="button button-accent" type="button" data-pick-ffmpeg>Locate FFmpeg</button>
+        <button class="button hidden" type="button" data-install-ffmpeg>Install FFmpeg</button>
         <button class="button" type="button" data-pick-folder>Choose output folder</button>
         <button class="button" type="button" data-pick-files disabled>Choose videos</button>
         <button class="button" type="button" data-stop disabled>Stop</button>
@@ -70,10 +76,29 @@ app.innerHTML = `
           <strong data-folder-name>Not selected</strong>
         </div>
       </div>
+      <div class="install-status hidden" data-install-status>
+        <div class="install-status-copy">
+          <strong data-install-status-label>Downloading FFmpeg...</strong>
+          <span data-install-status-meta>0%</span>
+        </div>
+        <div class="install-progress-bar">
+          <div class="install-progress-fill" data-install-progress-fill></div>
+        </div>
+      </div>
       <label class="toggle-row" for="save-beside-source">
         <span>Save beside source</span>
         <input id="save-beside-source" type="checkbox" data-save-beside-source />
       </label>
+      <div class="toggle-cluster">
+        <label class="toggle-row" for="has-alpha">
+          <span>Has alpha</span>
+          <input id="has-alpha" type="checkbox" data-has-alpha />
+        </label>
+        <label class="toggle-row" for="poster-image">
+          <span>Poster image</span>
+          <input id="poster-image" type="checkbox" data-poster-image />
+        </label>
+      </div>
       <div class="output-options">
         <div class="output-option-group">
           <span class="output-option-label">Formats</span>
@@ -100,8 +125,15 @@ app.innerHTML = `
             <input id="tier-480p" type="checkbox" data-output-tier="480p" checked />
             <span>480p</span>
           </label>
+          <label class="check-pill" for="tier-240p">
+            <input id="tier-240p" type="checkbox" data-output-tier="240p" checked />
+            <span>240p</span>
+          </label>
         </div>
       </div>
+      <p class="output-option-note hidden" data-alpha-note>
+        WebM alpha uses the WebM alpha codec path. Safari alpha usually requires a macOS FFmpeg build with hevc_videotoolbox.
+      </p>
     </section>
 
     <section class="dropzone-row">
@@ -110,6 +142,9 @@ app.innerHTML = `
       </button>
       <button class="dropzone" type="button" data-dropzone="image">
         <span class="dropzone-kicker">Drop images here</span>
+      </button>
+      <button class="dropzone" type="button" data-dropzone="poster">
+        <span class="dropzone-kicker">Drop videos for posters</span>
       </button>
     </section>
 
@@ -131,16 +166,25 @@ app.innerHTML = `
 const elements = {
   videoDropzone: app.querySelector('[data-dropzone="video"]'),
   imageDropzone: app.querySelector('[data-dropzone="image"]'),
+  posterDropzone: app.querySelector('[data-dropzone="poster"]'),
   ffmpegButton: app.querySelector('[data-pick-ffmpeg]'),
+  installFfmpegButton: app.querySelector('[data-install-ffmpeg]'),
   folderButton: app.querySelector('[data-pick-folder]'),
   pickButton: app.querySelector('[data-pick-files]'),
   stopButton: app.querySelector('[data-stop]'),
   resetButton: app.querySelector('[data-reset]'),
   saveBesideSourceToggle: app.querySelector('[data-save-beside-source]'),
+  hasAlphaToggle: app.querySelector('[data-has-alpha]'),
+  posterImageToggle: app.querySelector('[data-poster-image]'),
   formatToggles: [...app.querySelectorAll('[data-output-format]')],
   tierToggles: [...app.querySelectorAll('[data-output-tier]')],
+  alphaNote: app.querySelector('[data-alpha-note]'),
   ffmpegName: app.querySelector('[data-ffmpeg-name]'),
   folderName: app.querySelector('[data-folder-name]'),
+  installStatus: app.querySelector('[data-install-status]'),
+  installStatusLabel: app.querySelector('[data-install-status-label]'),
+  installStatusMeta: app.querySelector('[data-install-status-meta]'),
+  installProgressFill: app.querySelector('[data-install-progress-fill]'),
   batchHeadline: app.querySelector('[data-batch-headline]'),
   batchNote: app.querySelector('[data-batch-note]'),
   jobList: app.querySelector('[data-job-list]'),
@@ -154,6 +198,8 @@ const state = {
   nextJobId: 1,
   notice: '',
   saveBesideSource: false,
+  alphaRequested: false,
+  posterRequested: false,
   videoSelection: createDefaultVideoSelection(),
   ffmpeg: {
     ffmpegPath: '',
@@ -161,6 +207,7 @@ const state = {
     source: '',
     codecSupport: null,
   },
+  ffmpegInstall: createIdleInstallState(),
   outputDirectory: {
     path: '',
     name: '',
@@ -170,9 +217,16 @@ const state = {
 const unsubscribeFromJobEvents = desktop.onJobEvent((payload) => {
   handleJobEvent(payload);
 });
+const unsubscribeFromFfmpegInstallEvents = desktop.onFfmpegInstallEvent((payload) => {
+  handleFfmpegInstallEvent(payload);
+});
 
 elements.ffmpegButton.addEventListener('click', () => {
   void handlePickFfmpeg();
+});
+
+elements.installFfmpegButton.addEventListener('click', () => {
+  void handleInstallFfmpeg();
 });
 
 elements.folderButton.addEventListener('click', () => {
@@ -199,6 +253,18 @@ elements.saveBesideSourceToggle.addEventListener('change', (event) => {
   scheduleRender();
 });
 
+elements.hasAlphaToggle.addEventListener('change', (event) => {
+  state.alphaRequested = event.currentTarget.checked;
+  state.notice = '';
+  scheduleRender();
+});
+
+elements.posterImageToggle.addEventListener('change', (event) => {
+  state.posterRequested = event.currentTarget.checked;
+  state.notice = '';
+  scheduleRender();
+});
+
 for (const toggle of elements.formatToggles) {
   toggle.addEventListener('change', (event) => {
     const formatId = event.currentTarget.dataset.outputFormat;
@@ -219,6 +285,7 @@ for (const toggle of elements.tierToggles) {
 
 bindDropTarget(elements.videoDropzone, 'video');
 bindDropTarget(elements.imageDropzone, 'image');
+bindDropTarget(elements.posterDropzone, 'poster');
 
 app.addEventListener('click', (event) => {
   const folderButton = event.target.closest('[data-open-folder]');
@@ -230,6 +297,7 @@ app.addEventListener('click', (event) => {
 
 window.addEventListener('beforeunload', () => {
   unsubscribeFromJobEvents?.();
+  unsubscribeFromFfmpegInstallEvents?.();
 });
 
 void initializeApp();
@@ -238,8 +306,10 @@ function bindDropTarget(element, kind) {
   element.addEventListener('click', () => {
     if (kind === 'video') {
       void handlePickVideos();
-    } else {
+    } else if (kind === 'image') {
       void handlePickImages();
+    } else {
+      void handlePickPosterVideos();
     }
   });
 
@@ -268,14 +338,14 @@ function bindDropTarget(element, kind) {
 async function initializeApp() {
   try {
     const detected = await desktop.detectFfmpeg();
+    state.ffmpegInstall.supported = Boolean(detected?.installSupported);
 
     if (detected?.available) {
-      state.ffmpeg = detected;
-      state.notice = detected.codecSupport?.supported === false
-        ? (detected.codecSupport.errors?.[0] ?? 'This FFmpeg build is missing required video encoders.')
-        : '';
+      applyFfmpegSelection(detected);
     } else {
-      state.notice = 'FFmpeg was not found on PATH. Click Locate FFmpeg and choose ffmpeg.exe or ffmpeg.';
+      state.notice = detected?.staleSavedPath
+        ? 'Saved FFmpeg path was unavailable. Install FFmpeg or click Locate FFmpeg.'
+        : 'FFmpeg was not found on PATH. Install FFmpeg or click Locate FFmpeg.';
     }
   } catch (error) {
     state.notice = getErrorMessage(error);
@@ -292,16 +362,57 @@ async function handlePickFfmpeg() {
       return;
     }
 
-    state.ffmpeg = {
-      ffmpegPath: selected.ffmpegPath,
-      ffprobePath: selected.ffprobePath,
-      source: 'manual',
-      codecSupport: selected.codecSupport ?? null,
-    };
-    state.notice = selected.codecSupport?.supported === false
-      ? (selected.codecSupport.errors?.[0] ?? 'This FFmpeg build is missing required video encoders.')
-      : '';
+    applyFfmpegSelection(selected);
   } catch (error) {
+    state.notice = getErrorMessage(error);
+  }
+
+  scheduleRender();
+}
+
+async function handleInstallFfmpeg() {
+  if (state.ffmpegInstall.isInstalling) {
+    return;
+  }
+
+  state.ffmpegInstall = {
+    ...state.ffmpegInstall,
+    isInstalling: true,
+    stage: 'choosing-folder',
+    label: 'Choose where to install FFmpeg.',
+    meta: '',
+    progressRatio: 0,
+    bytesReceived: 0,
+    totalBytes: 0,
+  };
+  state.notice = '';
+  scheduleRender();
+
+  try {
+    const installed = await desktop.installFfmpeg();
+
+    if (!installed) {
+      state.ffmpegInstall = {
+        ...createIdleInstallState(),
+        supported: state.ffmpegInstall.supported,
+      };
+      scheduleRender();
+      return;
+    }
+
+    applyFfmpegSelection(installed);
+    state.ffmpegInstall = {
+      ...createIdleInstallState(),
+      supported: state.ffmpegInstall.supported,
+    };
+    state.notice = installed.version
+      ? `${installed.version} installed and verified.`
+      : 'FFmpeg installed and verified.';
+  } catch (error) {
+    state.ffmpegInstall = {
+      ...createIdleInstallState(),
+      supported: state.ffmpegInstall.supported,
+    };
     state.notice = getErrorMessage(error);
   }
 
@@ -345,6 +456,17 @@ async function handlePickImages() {
 
   const files = await desktop.chooseImages();
   await handleFileDescriptors(files, 'image');
+}
+
+async function handlePickPosterVideos() {
+  if (!canAcceptPosterJobs()) {
+    state.notice = getSetupMessage('poster');
+    scheduleRender();
+    return;
+  }
+
+  const files = await desktop.chooseVideos();
+  await handleFileDescriptors(files, 'poster');
 }
 
 async function handleDroppedFiles(fileList, kind) {
@@ -400,13 +522,16 @@ async function handleFileDescriptors(files, kind) {
 }
 
 function createJob(file, kind, usedNames) {
-  const fallbackName = kind === 'image' ? `image-${state.nextJobId}` : `video-${state.nextJobId}`;
+  const fallbackName = kind === 'image'
+    ? `image-${state.nextJobId}`
+    : `video-${state.nextJobId}`;
   const baseName = createUniqueBaseName(
     sanitizeBaseName(stripExtension(file.name) || fallbackName),
     usedNames,
   );
   const acceptsPath = kind === 'image' ? isLikelyImagePath : isLikelyVideoPath;
   const selectedVideoPlan = kind === 'video' ? getSelectedVideoPlan() : null;
+  const selectedImagePlan = kind === 'image' ? getSelectedImagePlan() : null;
   const job = {
     id: state.nextJobId,
     kind,
@@ -417,13 +542,20 @@ function createJob(file, kind, usedNames) {
     status: 'queued',
     currentVariant: '',
     completedVariants: 0,
-    outputTargetCount: kind === 'image' ? PRESETS.images.totalVariants : countVideoOutputs(selectedVideoPlan),
+    outputTargetCount: kind === 'image'
+      ? countImageOutputs(selectedImagePlan)
+      : kind === 'poster'
+        ? 1
+        : countVideoOutputs(selectedVideoPlan) + (state.posterRequested ? 1 : 0),
     progress: 0,
     outputs: [],
     warnings: [],
     errors: [],
     metadata: null,
     videoSelection: selectedVideoPlan,
+    imageSelection: selectedImagePlan,
+    alphaRequested: kind === 'video' ? state.alphaRequested : false,
+    posterRequested: kind === 'video' ? state.posterRequested : false,
   };
 
   state.nextJobId += 1;
@@ -453,12 +585,30 @@ function canAcceptImageJobs() {
     state.ffmpeg.ffmpegPath
     && state.ffmpeg.ffprobePath
     && state.ffmpeg.codecSupport?.images?.webp?.supported
+    && hasSelectedImageOutputs()
+    && (state.saveBesideSource || state.outputDirectory.path),
+  );
+}
+
+function canAcceptPosterJobs() {
+  return Boolean(
+    state.ffmpeg.ffmpegPath
+    && state.ffmpeg.ffprobePath
+    && state.ffmpeg.codecSupport?.images?.webp?.supported
     && (state.saveBesideSource || state.outputDirectory.path),
   );
 }
 
 function canAcceptKind(kind) {
-  return kind === 'image' ? canAcceptImageJobs() : canAcceptVideoJobs();
+  if (kind === 'image') {
+    return canAcceptImageJobs();
+  }
+
+  if (kind === 'poster') {
+    return canAcceptPosterJobs();
+  }
+
+  return canAcceptVideoJobs();
 }
 
 function getSetupMessage(kind) {
@@ -466,8 +616,14 @@ function getSetupMessage(kind) {
     return 'Choose FFmpeg first.';
   }
 
-  if (kind === 'image' && !state.ffmpeg.codecSupport?.images?.webp?.supported) {
-    return 'This FFmpeg build does not include a WebP encoder for image compression.';
+  if ((kind === 'image' || kind === 'poster') && !state.ffmpeg.codecSupport?.images?.webp?.supported) {
+    return kind === 'poster'
+      ? 'This FFmpeg build does not include a WebP encoder for poster exports.'
+      : 'This FFmpeg build does not include a WebP encoder for image compression.';
+  }
+
+  if (kind === 'image' && !hasSelectedImageOutputs()) {
+    return 'Select at least one tier. Image compression uses the same tier checkboxes as video.';
   }
 
   if (kind === 'video' && state.ffmpeg.codecSupport?.supported === false) {
@@ -482,7 +638,9 @@ function getSetupMessage(kind) {
     return 'Choose an output folder first or turn on Save beside source.';
   }
 
-  return `Squish is not ready to accept ${kind} files yet.`;
+  return kind === 'poster'
+    ? 'Squish is not ready to accept poster video files yet.'
+    : `Squish is not ready to accept ${kind} files yet.`;
 }
 
 async function processQueue() {
@@ -526,15 +684,52 @@ async function processJob(job) {
       inputPath: job.inputPath,
     });
 
-    const variants = job.kind === 'image'
-      ? buildImageVariantPlan(job.baseName, job.metadata, state.ffmpeg.codecSupport)
-      : buildVideoVariantPlan(job.baseName, job.metadata, state.ffmpeg.codecSupport, job.videoSelection);
+    const plan = job.kind === 'image'
+      ? {
+        variants: buildImageVariantPlan(
+          job.baseName,
+          job.metadata,
+          state.ffmpeg.codecSupport,
+          job.imageSelection,
+        ),
+        warnings: [],
+        errors: [],
+      }
+      : job.kind === 'poster'
+        ? {
+          variants: (() => {
+            const posterVariant = buildPosterVariant(job.baseName, job.metadata, state.ffmpeg.codecSupport);
+            return posterVariant ? [posterVariant] : [];
+          })(),
+          warnings: state.ffmpeg.codecSupport?.images?.webp?.supported
+            ? []
+            : ['Poster image could not be created because this FFmpeg build does not include a WebP encoder.'],
+          errors: [],
+        }
+      : buildVideoJobPlan({
+        baseName: job.baseName,
+        metadata: job.metadata,
+        codecSupport: state.ffmpeg.codecSupport,
+        selection: job.videoSelection,
+        alphaRequested: job.alphaRequested,
+        posterRequested: job.posterRequested,
+      });
 
-    if (!variants.length) {
-      throw new Error('No output variants were selected for this video.');
+    for (const warning of plan.warnings) {
+      appendUniqueMessage(job.warnings, warning);
     }
 
-    job.outputTargetCount = variants.length;
+    if (!plan.variants.length && plan.errors.length) {
+      throw new Error(plan.errors[0]);
+    }
+
+    if (!plan.variants.length) {
+      throw new Error(job.kind === 'poster'
+        ? 'No poster output could be created for this video.'
+        : 'No output variants were selected for this video.');
+    }
+
+    job.outputTargetCount = plan.variants.length;
     job.status = 'transcoding';
     job.currentVariant = job.kind === 'image' ? 'Preparing WebP' : 'Launching FFmpeg';
     scheduleRender();
@@ -545,10 +740,14 @@ async function processJob(job) {
       outputDirectory: state.outputDirectory.path,
       baseName: job.baseName,
       ffmpegPath: state.ffmpeg.ffmpegPath,
-      variants,
+      variants: plan.variants,
       durationSeconds: job.kind === 'video' ? job.metadata.duration : 0,
       saveBesideSource: state.saveBesideSource,
     });
+
+    if (plan.errors.length) {
+      throw new Error(plan.errors[0]);
+    }
 
     job.currentVariant = '';
     job.progress = 1;
@@ -594,6 +793,25 @@ async function handleOpenFolder(targetPath) {
   }
 }
 
+function handleFfmpegInstallEvent(payload) {
+  if (!payload) {
+    return;
+  }
+
+  state.ffmpegInstall = {
+    ...state.ffmpegInstall,
+    isInstalling: payload.stage !== 'complete',
+    stage: payload.stage ?? '',
+    label: payload.message ?? getInstallStageLabel(payload.stage),
+    meta: formatInstallMeta(payload),
+    progressRatio: normalizeInstallProgress(payload.progressRatio),
+    bytesReceived: payload.bytesReceived ?? 0,
+    totalBytes: payload.totalBytes ?? 0,
+  };
+
+  scheduleRender();
+}
+
 function stopQueuedJobs() {
   for (const job of state.jobs) {
     if (job.status === 'queued') {
@@ -620,7 +838,7 @@ function handleJobEvent(payload) {
 
   switch (payload.type) {
     case 'variant-start':
-      job.currentVariant = `${job.kind === 'image' ? 'Creating' : 'Encoding'} ${payload.label}`;
+      job.currentVariant = `${payload.variant?.mediaKind === 'image' ? 'Creating' : 'Encoding'} ${payload.label}`;
       job.progress = calculateJobProgress(payload.variantIndex, 0, job.outputTargetCount);
       break;
     case 'progress':
@@ -636,6 +854,11 @@ function handleJobEvent(payload) {
       job.completedVariants = payload.variantIndex + 1;
       job.progress = calculateJobProgress(job.completedVariants, 0, job.outputTargetCount);
       job.currentVariant = `Finished ${getVariantLabel(payload.variant)}`;
+      break;
+    case 'variant-skipped':
+      job.completedVariants = payload.variantIndex + 1;
+      job.progress = calculateJobProgress(job.completedVariants, 0, job.outputTargetCount);
+      job.currentVariant = `Skipped ${getVariantLabel(payload.variant)}`;
       break;
     case 'output':
       job.outputs.push(payload.artifact);
@@ -683,7 +906,11 @@ function getStatusLabel(job) {
     case 'probing':
       return 'Reading metadata';
     case 'transcoding':
-      return job.kind === 'image' ? 'Compressing' : 'Transcoding';
+      return job.kind === 'image'
+        ? 'Compressing'
+        : job.kind === 'poster'
+          ? 'Creating poster'
+          : 'Transcoding';
     case 'done':
       return job.errors.length || job.warnings.length ? 'Done with warnings' : 'Done';
     case 'stopped':
@@ -693,6 +920,88 @@ function getStatusLabel(job) {
     default:
       return 'Queued';
   }
+}
+
+function createIdleInstallState() {
+  return {
+    supported: false,
+    isInstalling: false,
+    stage: '',
+    label: '',
+    meta: '',
+    progressRatio: 0,
+    bytesReceived: 0,
+    totalBytes: 0,
+  };
+}
+
+function applyFfmpegSelection(selection) {
+  state.ffmpeg = {
+    ffmpegPath: selection.ffmpegPath,
+    ffprobePath: selection.ffprobePath,
+    source: selection.source ?? state.ffmpeg.source ?? '',
+    codecSupport: selection.codecSupport ?? null,
+  };
+  state.notice = selection.codecSupport?.supported === false
+    ? (selection.codecSupport.errors?.[0] ?? 'This FFmpeg build is missing required video encoders.')
+    : '';
+}
+
+function getFfmpegStatusLabel() {
+  if (!state.ffmpeg.ffmpegPath) {
+    return 'FFmpeg not configured';
+  }
+
+  if (state.ffmpeg.source === 'PATH') {
+    return `${state.ffmpeg.ffmpegPath} (PATH)`;
+  }
+
+  if (state.ffmpeg.source === 'config') {
+    return `${state.ffmpeg.ffmpegPath} (saved)`;
+  }
+
+  if (state.ffmpeg.source === 'installed') {
+    return `${state.ffmpeg.ffmpegPath} (installed)`;
+  }
+
+  return state.ffmpeg.ffmpegPath;
+}
+
+function getInstallStageLabel(stage) {
+  switch (stage) {
+    case 'choosing-folder':
+      return 'Choose where to install FFmpeg.';
+    case 'downloading':
+      return 'Downloading FFmpeg...';
+    case 'extracting':
+      return 'Extracting FFmpeg...';
+    case 'verifying':
+      return 'Verifying the FFmpeg install...';
+    case 'complete':
+      return 'FFmpeg installed.';
+    default:
+      return '';
+  }
+}
+
+function formatInstallMeta(payload) {
+  if (payload.stage === 'downloading') {
+    if (payload.totalBytes > 0) {
+      return `${formatPercent(normalizeInstallProgress(payload.progressRatio))} / ${formatBytes(payload.bytesReceived)} of ${formatBytes(payload.totalBytes)}`;
+    }
+
+    if (payload.bytesReceived > 0) {
+      return formatBytes(payload.bytesReceived);
+    }
+  }
+
+  return '';
+}
+
+function normalizeInstallProgress(value) {
+  return Number.isFinite(value) && value >= 0
+    ? Math.min(value, 1)
+    : 0;
 }
 
 function scheduleRender() {
@@ -716,27 +1025,50 @@ function render() {
   const ffmpegReady = Boolean(state.ffmpeg.ffmpegPath && state.ffmpeg.ffprobePath);
   const imageSupported = Boolean(state.ffmpeg.codecSupport?.images?.webp?.supported);
   const targetLabel = state.saveBesideSource ? 'source folders' : 'the selected folder';
+  const showInstallButton = state.ffmpegInstall.supported && !ffmpegReady;
+  const showInstallStatus = state.ffmpegInstall.isInstalling || state.ffmpegInstall.label;
+  const installProgressWidth = `${Math.round((state.ffmpegInstall.progressRatio ?? 0) * 100)}%`;
 
+  elements.ffmpegButton.disabled = state.ffmpegInstall.isInstalling;
+  elements.installFfmpegButton.disabled = state.ffmpegInstall.isInstalling;
+  elements.installFfmpegButton.classList.toggle('hidden', !showInstallButton);
+  elements.installFfmpegButton.textContent = state.ffmpegInstall.isInstalling
+    ? 'Installing FFmpeg...'
+    : 'Install FFmpeg';
   elements.pickButton.disabled = !canAcceptVideoJobs() || state.stopRequested;
   elements.stopButton.disabled = !state.isProcessing || state.stopRequested;
   elements.resetButton.disabled = state.jobs.length === 0 || state.isProcessing;
   elements.saveBesideSourceToggle.checked = state.saveBesideSource;
+  elements.hasAlphaToggle.checked = state.alphaRequested;
+  elements.posterImageToggle.checked = state.posterRequested;
+  elements.alphaNote.classList.toggle('hidden', !state.alphaRequested);
+  elements.installStatus.classList.toggle('hidden', !showInstallStatus);
+  elements.installStatusLabel.textContent = state.ffmpegInstall.label || 'Downloading FFmpeg...';
+  elements.installStatusMeta.textContent = state.ffmpegInstall.meta || '';
+  elements.installProgressFill.style.width = installProgressWidth;
   syncSelectionToggles();
 
-  for (const [kind, element] of [['video', elements.videoDropzone], ['image', elements.imageDropzone]]) {
+  for (const [kind, element] of [
+    ['video', elements.videoDropzone],
+    ['image', elements.imageDropzone],
+    ['poster', elements.posterDropzone],
+  ]) {
     const canAccept = canAcceptKind(kind);
     element.disabled = !canAccept || state.stopRequested;
     element.classList.toggle('is-disabled', !canAccept || state.stopRequested);
   }
 
   elements.ffmpegName.textContent = ffmpegReady
-    ? state.ffmpeg.ffmpegPath
+    ? getFfmpegStatusLabel()
     : 'FFmpeg not configured';
   elements.folderName.textContent = state.saveBesideSource
     ? 'Source folders'
     : (state.outputDirectory.path || 'Not selected');
 
-  if (state.stopRequested) {
+  if (state.ffmpegInstall.isInstalling) {
+    elements.batchHeadline.textContent = 'Installing FFmpeg.';
+    elements.batchNote.textContent = state.ffmpegInstall.label || 'Downloading and installing FFmpeg for Squish.';
+  } else if (state.stopRequested) {
     elements.batchHeadline.textContent = 'Stopping current work.';
     elements.batchNote.textContent = 'The active native FFmpeg process is being killed. Any unfinished file for that variant will be deleted.';
   } else if (state.isProcessing) {
@@ -751,14 +1083,22 @@ function render() {
     elements.batchHeadline.textContent = 'Batch finished.';
     elements.batchNote.textContent = `Saved ${state.jobs.reduce((sum, job) => sum + job.outputs.length, 0)} files (${formatBytes(savedBytes)}) into ${targetLabel}.`;
   } else if (!ffmpegReady) {
-    elements.batchHeadline.textContent = 'Locate FFmpeg first.';
-    elements.batchNote.textContent = 'Squish needs a native FFmpeg install. If it is already on PATH, it will auto-detect on launch.';
+    elements.batchHeadline.textContent = showInstallButton ? 'Install or locate FFmpeg first.' : 'Locate FFmpeg first.';
+    elements.batchNote.textContent = showInstallButton
+      ? 'Squish can download the latest full Windows FFmpeg build for you, or you can point it at an existing ffmpeg.exe.'
+      : 'Squish needs a native FFmpeg install. If it is already on PATH, it will auto-detect on launch.';
   } else if (state.ffmpeg.codecSupport?.supported === false) {
     elements.batchHeadline.textContent = 'This FFmpeg build is missing required video encoders.';
     elements.batchNote.textContent = state.ffmpeg.codecSupport.errors?.[0] ?? 'Choose another FFmpeg build.';
+  } else if (!hasSelectedImageOutputs()) {
+    elements.batchHeadline.textContent = 'Select output tiers.';
+    elements.batchNote.textContent = 'Image compression and video tiers share the same tier checkboxes. Poster-only exports still work.';
   } else if (!hasSelectedVideoOutputs()) {
-    elements.batchHeadline.textContent = 'Select video outputs.';
-    elements.batchNote.textContent = 'Choose at least one format and one tier for video jobs. Images still export as WebP.';
+    elements.batchHeadline.textContent = 'Video outputs are disabled.';
+    elements.batchNote.textContent = 'Choose at least one video format if you want MP4 or WebM exports. Image compression and poster-only WebP exports still work.';
+  } else if (state.alphaRequested && !state.ffmpeg.codecSupport?.alphaTargets?.safari?.supported) {
+    elements.batchHeadline.textContent = 'Alpha mode is ready for WebM.';
+    elements.batchNote.textContent = 'This FFmpeg build can preserve alpha in WebM, but Safari alpha MP4 output will be skipped. In practice that path usually requires macOS FFmpeg with hevc_videotoolbox.';
   } else if (!imageSupported) {
     elements.batchHeadline.textContent = 'Video compression is ready.';
     elements.batchNote.textContent = 'This FFmpeg build can compress videos, but it does not include a WebP encoder for images.';
@@ -769,7 +1109,7 @@ function render() {
     elements.batchHeadline.textContent = 'Ready.';
     elements.batchNote.textContent = state.saveBesideSource
       ? 'Drop files to save outputs directly beside each source file.'
-      : 'Drop videos for MP4 and WebM exports, or drop images for HD-bounded WebP compression.';
+      : 'Drop videos for MP4 and WebM exports, drop images for WebP compression, or drop videos for poster-only WebP exports.';
   }
 
   if (state.jobs.length === 0) {
@@ -791,7 +1131,7 @@ function renderJob(job) {
   const outputBytes = job.outputs.reduce((sum, output) => sum + output.size, 0);
   const outputFolder = getJobOutputFolder(job);
   const dimensions = job.metadata
-    ? `${job.metadata.width}x${job.metadata.height}${job.kind === 'video' && job.metadata.duration > 0 ? ` / ${job.metadata.duration.toFixed(1)}s / ${job.metadata.fps.toFixed(2)} fps` : ''}`
+    ? `${job.metadata.width}x${job.metadata.height}${job.kind === 'video' && job.metadata.duration > 0 ? ` / ${job.metadata.duration.toFixed(1)}s / ${job.metadata.fps.toFixed(2)} fps` : ''}${job.metadata.hasAlpha ? ' / alpha' : ''}`
     : 'Inspecting metadata';
   const artifacts = job.outputs.length ? renderArtifactTable(job.outputs) : '';
   const warnings = job.warnings.length
@@ -900,14 +1240,32 @@ function getSelectedVideoPlan() {
     formats: Object.entries(state.videoSelection.formats)
       .filter(([, enabled]) => enabled)
       .map(([formatId]) => formatId),
-    tiers: Object.entries(state.videoSelection.tiers)
-      .filter(([, enabled]) => enabled)
-      .map(([tierId]) => tierId),
+    tiers: getSelectedTierIds(),
   };
+}
+
+function getSelectedImagePlan() {
+  return {
+    tiers: getSelectedTierIds(),
+  };
+}
+
+function getSelectedTierIds() {
+  return Object.entries(state.videoSelection.tiers)
+    .filter(([, enabled]) => enabled)
+    .map(([tierId]) => tierId);
 }
 
 function countVideoOutputs(selection) {
   return (selection?.formats?.length ?? 0) * (selection?.tiers?.length ?? 0);
+}
+
+function countImageOutputs(selection) {
+  return selection?.tiers?.length ?? 0;
+}
+
+function hasSelectedImageOutputs() {
+  return countImageOutputs(getSelectedImagePlan()) > 0;
 }
 
 function hasSelectedVideoOutputs() {

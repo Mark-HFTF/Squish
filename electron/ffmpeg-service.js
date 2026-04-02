@@ -14,9 +14,11 @@ import {
   parseEncoderNames,
   parseFrameRate,
   parseProgressLine,
+  pixelFormatHasAlpha,
   resolvePeerBinary,
 } from './ffmpeg-utils.js';
 import { resolveJobOutputRoot } from './output-paths.js';
+import { spawnForOutput } from './process-utils.js';
 
 const state = {
   activeChild: null,
@@ -46,36 +48,6 @@ const WEBM_PROGRESS_WINDOWS = [
   ],
 ];
 
-function spawnForOutput(command, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString();
-    });
-
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    child.once('error', reject);
-    child.once('close', (code) => {
-      if (code === 0) {
-        resolve({ stdout, stderr });
-      } else {
-        const message = stderr.trim() || stdout.trim() || `${command} exited with code ${code}`;
-        reject(new Error(message));
-      }
-    });
-  });
-}
-
 export async function validateExecutable(command, args = ['-version']) {
   try {
     await spawnForOutput(command, args);
@@ -85,48 +57,60 @@ export async function validateExecutable(command, args = ['-version']) {
   }
 }
 
-export async function detectFfmpegTools() {
+export async function detectFfmpegTools(savedTools = null) {
+  const candidates = [];
+
+  if (savedTools?.ffmpegPath) {
+    candidates.push({
+      ffmpegPath: savedTools.ffmpegPath,
+      ffprobePath: savedTools.ffprobePath || resolvePeerBinary(savedTools.ffmpegPath, 'ffprobe'),
+      source: 'config',
+      persisted: true,
+    });
+  }
+
   const defaultFfmpegPath = getDefaultFfmpegPath();
-  const defaultFfprobePath = resolvePeerBinary(defaultFfmpegPath, 'ffprobe');
 
-  if (
-    defaultFfmpegPath
-    && await validateExecutable(defaultFfmpegPath)
-    && await validateExecutable(defaultFfprobePath)
-  ) {
-    const codecSupport = await inspectCodecSupport(defaultFfmpegPath);
-
-    return {
-      available: true,
+  if (defaultFfmpegPath) {
+    candidates.push({
       ffmpegPath: defaultFfmpegPath,
-      ffprobePath: defaultFfprobePath,
+      ffprobePath: resolvePeerBinary(defaultFfmpegPath, 'ffprobe'),
       source: 'default',
-      codecSupport,
-    };
+      persisted: false,
+    });
   }
 
-  const ffmpegPath = 'ffmpeg';
-  const ffprobePath = 'ffprobe';
-  const available = await validateExecutable(ffmpegPath) && await validateExecutable(ffprobePath);
+  candidates.push({
+    ffmpegPath: 'ffmpeg',
+    ffprobePath: 'ffprobe',
+    source: 'PATH',
+    persisted: false,
+  });
 
-  if (!available) {
-    return {
-      available: false,
-      ffmpegPath: '',
-      ffprobePath: '',
-      source: '',
-      codecSupport: null,
-    };
+  let staleSavedPath = false;
+
+  for (const candidate of candidates) {
+    const detected = await inspectToolPair(candidate.ffmpegPath, candidate.ffprobePath, candidate.source);
+
+    if (detected) {
+      return {
+        ...detected,
+        staleSavedPath,
+      };
+    }
+
+    if (candidate.persisted) {
+      staleSavedPath = true;
+    }
   }
-
-  const codecSupport = await inspectCodecSupport(ffmpegPath);
 
   return {
-    available: true,
-    ffmpegPath,
-    ffprobePath,
-    source: 'PATH',
-    codecSupport,
+    available: false,
+    ffmpegPath: '',
+    ffprobePath: '',
+    source: '',
+    codecSupport: null,
+    staleSavedPath,
   };
 }
 
@@ -163,6 +147,29 @@ export async function validateToolPair(ffmpegPath, ffprobePath = resolvePeerBina
   };
 }
 
+async function inspectToolPair(ffmpegPath, ffprobePath, source) {
+  if (!ffmpegPath || !ffprobePath) {
+    return null;
+  }
+
+  const hasFfmpeg = await validateExecutable(ffmpegPath);
+  const hasFfprobe = hasFfmpeg ? await validateExecutable(ffprobePath) : false;
+
+  if (!hasFfmpeg || !hasFfprobe) {
+    return null;
+  }
+
+  const codecSupport = await inspectCodecSupport(ffmpegPath);
+
+  return {
+    available: true,
+    ffmpegPath,
+    ffprobePath,
+    source,
+    codecSupport,
+  };
+}
+
 export async function describeFiles(filePaths) {
   return Promise.all(filePaths.map(async (filePath) => {
     const stats = await fs.stat(filePath);
@@ -182,7 +189,7 @@ export async function probeVisualAsset({ ffprobePath, inputPath }) {
     '-select_streams',
     'v:0',
     '-show_entries',
-    'stream=width,height,avg_frame_rate,r_frame_rate:format=duration',
+    'stream=width,height,pix_fmt,avg_frame_rate,r_frame_rate:format=duration',
     '-of',
     'json',
     inputPath,
@@ -206,6 +213,8 @@ export async function probeVisualAsset({ ffprobePath, inputPath }) {
     height: Number(stream.height),
     duration,
     fps,
+    pixFmt: stream.pix_fmt ?? '',
+    hasAlpha: pixelFormatHasAlpha(stream.pix_fmt),
   };
 }
 
@@ -258,66 +267,86 @@ export async function transcodeJob(options, emit) {
         label: getVariantLabel(variant),
       });
 
-      const execution = variant.executionMode === 'vp9-two-pass'
-        ? await runWebmVariant({
-          ffmpegPath,
-          inputPath,
-          outputPath,
-          outputRoot,
-          variant,
-          artifacts,
-          durationSeconds,
+      try {
+        const execution = variant.executionMode === 'vp9-two-pass'
+          ? await runWebmVariant({
+            ffmpegPath,
+            inputPath,
+            outputPath,
+            outputRoot,
+            variant,
+            artifacts,
+            durationSeconds,
+            jobId,
+            variantIndex: index,
+          }, emit)
+          : await runSinglePassVariant({
+            ffmpegPath,
+            inputPath,
+            outputPath,
+            variant,
+            durationSeconds,
+            jobId,
+            variantIndex: index,
+          }, emit);
+
+        const stats = await fs.stat(execution.outputPath);
+        const artifact = {
           jobId,
-          variantIndex: index,
-        }, emit)
-        : await runSinglePassVariant({
-          ffmpegPath,
-          inputPath,
-          outputPath,
-          variant,
-          durationSeconds,
+          tier: variant.tierId,
+          format: variant.formatId,
+          filename: variant.filename,
+          outputPath: execution.outputPath,
+          size: stats.size,
+          width: variant.dimensions.width,
+          height: variant.dimensions.height,
+          warnings: execution.warnings ?? [],
+        };
+
+        artifacts.push(artifact);
+
+        for (const warning of artifact.warnings) {
+          emit({
+            type: 'warning',
+            jobId,
+            variant,
+            variantIndex: index,
+            message: warning,
+          });
+        }
+
+        emit({
+          type: 'output',
           jobId,
+          variant,
           variantIndex: index,
-        }, emit);
+          artifact,
+        });
+        emit({
+          type: 'variant-complete',
+          jobId,
+          variant,
+          variantIndex: index,
+        });
+      } catch (error) {
+        if (!variant.optional) {
+          throw error;
+        }
 
-      const stats = await fs.stat(execution.outputPath);
-      const artifact = {
-        jobId,
-        tier: variant.tierId,
-        format: variant.formatId,
-        filename: variant.filename,
-        outputPath: execution.outputPath,
-        size: stats.size,
-        width: variant.dimensions.width,
-        height: variant.dimensions.height,
-        warnings: execution.warnings ?? [],
-      };
-
-      artifacts.push(artifact);
-
-      for (const warning of artifact.warnings) {
         emit({
           type: 'warning',
           jobId,
           variant,
           variantIndex: index,
-          message: warning,
+          message: `${getVariantLabel(variant)} could not be created and was skipped. ${getErrorMessage(error)}`,
+        });
+        emit({
+          type: 'variant-skipped',
+          jobId,
+          variant,
+          variantIndex: index,
         });
       }
-
-      emit({
-        type: 'output',
-        jobId,
-        variant,
-        variantIndex: index,
-        artifact,
-      });
-      emit({
-        type: 'variant-complete',
-        jobId,
-        variant,
-        variantIndex: index,
-      });
     }
 
     return { artifacts, errors: [] };
@@ -332,7 +361,8 @@ export async function transcodeJob(options, emit) {
 async function inspectCodecSupport(ffmpegPath) {
   const { stdout, stderr } = await spawnForOutput(ffmpegPath, ['-hide_banner', '-encoders']);
   const encoders = parseEncoderNames(`${stdout}\n${stderr}`);
-  return resolveCodecSupport(encoders);
+  const alphaTargets = await inspectAlphaTargets(ffmpegPath, encoders);
+  return resolveCodecSupport(encoders, { alphaTargets });
 }
 
 export function stopActiveTranscode() {
@@ -374,6 +404,14 @@ async function runSinglePassVariant(context, emit) {
     cleanupOutputOnFailure: true,
   }, emit);
 
+  if (variant.verifyAlpha) {
+    await verifyAlphaOutput({
+      ffmpegPath,
+      inputPath: outputPath,
+      decoder: variant.videoCodec,
+    });
+  }
+
   return {
     outputPath,
     warnings: [],
@@ -395,26 +433,32 @@ async function runWebmVariant(context, emit) {
   const matchingMp4 = artifacts.find(
     (artifact) => artifact.tier === variant.tierId && artifact.format === 'mp4',
   );
-  const referenceMp4 = matchingMp4
-    ? matchingMp4
-    : await createReferenceMp4({
-      ffmpegPath,
-      inputPath,
-      outputRoot,
-      variant,
-      durationSeconds,
-      jobId,
-      variantIndex,
-    }, emit);
+  const shouldEnforceMp4Size = !variant.skipSizeGuard;
+  const referenceMp4 = shouldEnforceMp4Size
+    ? (matchingMp4
+      ? matchingMp4
+      : await createReferenceMp4({
+        ffmpegPath,
+        inputPath,
+        outputRoot,
+        variant,
+        durationSeconds,
+        jobId,
+        variantIndex,
+      }, emit))
+    : null;
 
-  if (!referenceMp4) {
+  if (shouldEnforceMp4Size && !referenceMp4) {
     throw new Error(`Missing MP4 reference output for ${variant.tierLabel} WebM sizing.`);
   }
 
-  const mp4AverageBitrateBps = calculateAverageBitrate(referenceMp4.size, durationSeconds);
+  const mp4AverageBitrateBps = shouldEnforceMp4Size
+    ? calculateAverageBitrate(referenceMp4.size, durationSeconds)
+    : null;
   const nullOutput = process.platform === 'win32' ? 'NUL' : '/dev/null';
+  const attemptCount = shouldEnforceMp4Size ? variant.retrySteps.length : 1;
 
-  for (let attemptIndex = 0; attemptIndex < variant.retrySteps.length; attemptIndex += 1) {
+  for (let attemptIndex = 0; attemptIndex < attemptCount; attemptIndex += 1) {
     const passlogFile = path.join(outputRoot, `${variant.id}-attempt-${attemptIndex}`);
     const rateControl = resolveVp9AttemptRateControl({
       variant,
@@ -468,6 +512,13 @@ async function runWebmVariant(context, emit) {
 
     const stats = await fs.stat(outputPath);
 
+    if (!shouldEnforceMp4Size) {
+      return {
+        outputPath,
+        warnings: [],
+      };
+    }
+
     if (stats.size <= referenceMp4.size) {
       return {
         outputPath,
@@ -489,6 +540,92 @@ async function runWebmVariant(context, emit) {
   }
 
   throw new Error(`Unable to finish ${getVariantLabel(variant)}.`);
+}
+
+async function inspectAlphaTargets(ffmpegPath, encoders) {
+  const safariSupport = await inspectSafariAlphaSupport(ffmpegPath, encoders);
+
+  return {
+    safari: safariSupport,
+  };
+}
+
+async function inspectSafariAlphaSupport(ffmpegPath, encoders) {
+  if (!encoders.has('hevc_videotoolbox')) {
+    return {
+      supported: false,
+      encoder: '',
+      label: '',
+      optionName: '',
+      optionValue: '',
+      pixelFormat: '',
+      baseArgs: [],
+    };
+  }
+
+  try {
+    const { stdout, stderr } = await spawnForOutput(ffmpegPath, ['-hide_banner', '-h', 'encoder=hevc_videotoolbox']);
+    const help = `${stdout}\n${stderr}`;
+
+    if (!/alpha_quality/i.test(help)) {
+      return {
+        supported: false,
+        encoder: '',
+        label: '',
+        optionName: '',
+        optionValue: '',
+        pixelFormat: '',
+        baseArgs: [],
+      };
+    }
+
+    return {
+      supported: true,
+      encoder: 'hevc_videotoolbox',
+      label: 'hevc_videotoolbox',
+      optionName: 'alpha_quality',
+      optionValue: '0.75',
+      pixelFormat: 'bgra',
+      baseArgs: ['-allow_sw', '1', '-tag:v', 'hvc1', '-movflags', '+faststart'],
+    };
+  } catch {
+    return {
+      supported: false,
+      encoder: '',
+      label: '',
+      optionName: '',
+      optionValue: '',
+      pixelFormat: '',
+      baseArgs: [],
+    };
+  }
+}
+
+async function verifyAlphaOutput({ ffmpegPath, inputPath, decoder }) {
+  const args = [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-c:v',
+    decoder,
+    '-i',
+    inputPath,
+    '-map',
+    '0:v:0',
+    '-vf',
+    'alphaextract',
+    '-frames:v',
+    '1',
+    '-f',
+    'null',
+    '-',
+  ];
+
+  try {
+    await spawnForOutput(ffmpegPath, args);
+  } catch (error) {
+    throw new Error(`Encoded WebM did not verify with an alpha plane. ${getErrorMessage(error)}`);
+  }
 }
 
 async function createReferenceMp4(context, emit) {
